@@ -3,8 +3,18 @@ import discord
 from discord.ext import commands
 
 from src.config import settings
+from src.claude_runner import run_claude
 
 logger = logging.getLogger(__name__)
+
+
+ORCHESTRATOR_SYSTEM_PROMPT = """Eres el Orquestador de un equipo de desarrollo de software \
+especializado en sistemas de trading. Tu rol es dirigir un equipo compuesto por Jefe de Proyecto, \
+Product Owner, Tech Lead y dos Analistas de trading.
+
+Por ahora solo estás validando la conexión. Responde al usuario de forma breve y profesional, \
+confirmando que has recibido su mensaje y dando un apunte útil si procede. No inventes que has \
+consultado a otros miembros del equipo — aún no están activos. Máximo 3 frases."""
 
 
 def build_bot() -> commands.Bot:
@@ -33,9 +43,23 @@ def build_bot() -> commands.Bot:
             return
 
         logger.info(f"Mensaje de {message.author.name}: {message.content}")
-        await message.channel.send(
-            f"Te escucho, {message.author.mention}. "
-            f"(Echo de momento, aún sin agentes.)"
-        )
+
+        async with message.channel.typing():
+            try:
+                response = await run_claude(
+                    prompt=message.content,
+                    model="haiku",
+                    system_prompt=ORCHESTRATOR_SYSTEM_PROMPT,
+                )
+                reply = response.result or "(Respuesta vacía)"
+                logger.info(
+                    f"Respuesta generada ({response.input_tokens} in / "
+                    f"{response.output_tokens} out / ${response.cost_usd:.4f})"
+                )
+            except Exception as e:
+                logger.exception("Error llamando a Claude Code")
+                reply = f"⚠️ Error interno: {e}"
+
+        await message.channel.send(reply)
 
     return bot

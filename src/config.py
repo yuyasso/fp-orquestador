@@ -10,5 +10,11 @@ class Settings(BaseSettings):
     discord_anuncios_channel_id: int
     discord_my_user_id: int
 
+    discord_webhook_jefe: str
+    discord_webhook_po: str
+    discord_webhook_tl: str
+    discord_webhook_a1: str
+    discord_webhook_a2: str
+
 
 settings = Settings()
