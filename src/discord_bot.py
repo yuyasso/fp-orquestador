@@ -28,19 +28,14 @@ def build_bot() -> commands.Bot:
 
     @bot.event
     async def on_message(message: discord.Message):
-        # Ignorar mensajes del propio bot
         if message.author == bot.user:
             return
-        # Ignorar mensajes procedentes de webhooks (los propios agentes)
         if message.webhook_id is not None:
             return
-        # Ignorar mensajes de otros bots
         if message.author.bot:
             return
-        # Solo atendemos #lobby por ahora
         if message.channel.id != settings.discord_lobby_channel_id:
             return
-        # Ignorar mensajes vacíos (ej. adjuntos sin texto)
         if not message.content.strip():
             return
 
@@ -58,8 +53,10 @@ def build_bot() -> commands.Bot:
                     notify_clarification=notify_clarification,
                 )
                 logger.info(
-                    f"Turno completo: speakers={result.speakers_invoked} "
-                    f"clarify={result.needs_clarification}"
+                    f"Turno completo: route={result.route} "
+                    f"speakers={result.speakers_invoked} "
+                    f"phases={result.phases_visited} "
+                    f"halted={result.halted_reason}"
                 )
             except Exception as e:
                 logger.exception("Error en handle_user_message")

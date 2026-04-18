@@ -1,6 +1,7 @@
 """
-Decisor: decide qué rol(es) deben responder a un mensaje y en qué orden.
-Si no tiene claro a quién convocar, puede pedir clarificación al humano.
+Decisor: decide quién responde a continuación en la conversación.
+Funciona tanto para el primer turno tras un mensaje humano como para
+turnos sucesivos donde el último mensaje puede ser de otro agente.
 """
 import json
 import logging
@@ -12,59 +13,69 @@ logger = logging.getLogger(__name__)
 
 
 DECIDER_SYSTEM_PROMPT = """Eres el Orquestador de un equipo de desarrollo de un sistema de trading. \
-Tu única tarea es decidir qué miembros del equipo deben responder al mensaje del humano y en qué orden.
+Tu única tarea es decidir QUÉ ÚNICO miembro del equipo debe hablar A CONTINUACIÓN, \
+o si el turno ya debe cerrarse.
 
-El equipo está compuesto por:
-- "jefe" (Jefe de Proyecto): exigente, supervisa calidad global, interviene en temas estratégicos, riesgos, o cuando detecta conformismo. NO participa en cada mensaje.
-- "po" (Product Owner): define alcance, prioriza, valida entregas, traduce necesidades en requisitos.
-- "tl" (Tech Lead): decisiones técnicas, arquitectura, stack, interlocutor con Claude Code para código.
-- "a1" (Analista 1, cuantitativo): estrategias clásicas, rigor estadístico, métricas, backtesting robusto.
-- "a2" (Analista 2, microestructura): régimen de mercado, order flow, contexto macro, liquidez.
+El equipo:
+- "jefe" (Jefe de Proyecto): exigente, supervisa calidad global, combate conformismo, interviene en temas estratégicos y riesgos. NO participa en cada mensaje.
+- "po" (Product Owner): define alcance, prioriza, valida entregas, sintetiza acuerdos.
+- "tl" (Tech Lead): decisiones técnicas, arquitectura, stack, interlocutor con Claude Code.
+- "a1" (Analista 1, cuantitativo): estrategias clásicas, rigor estadístico, métricas.
+- "a2" (Analista 2, microestructura): régimen de mercado, order flow, contexto macro.
 
-Reglas de convocatoria:
-1. Saludos, agradecimientos, small talk, mensajes triviales → NADIE responde. speakers = [].
-2. Pregunta técnica concreta sobre arquitectura, stack, código → solo "tl".
-3. Pregunta sobre qué construir, prioridades, alcance, aceptación → solo "po".
-4. Pregunta sobre estrategias de trading, análisis de mercado, qué invertir → "a1" y "a2" en ese orden para que debatan.
-5. Pregunta estratégica de alto nivel, o mensaje donde se detecta que el equipo se está conformando con algo mediocre → "jefe".
-6. Mensajes complejos que requieren varios roles → lista ordenada con máximo 3 speakers.
-7. Cuando haya dudas, sé PARCO: es mejor que solo 1-2 roles hablen que convocar a todos.
-8. El humano (Fran) tiene autoridad: si pide explícitamente escuchar a alguien concreto ("quiero que opine TL", "@po qué opinas"), convoca a ESE rol aunque las demás reglas sugieran otro.
+El humano del equipo se llama Fran. Sus mensajes tienen MÁXIMA PRIORIDAD: si pide algo explícito, respétalo por encima de las otras reglas.
 
-Si el mensaje es GENUINAMENTE AMBIGUO y no sabes a quién convocar (podría ser técnico o de producto, podría ser estrategia o decisión de alto nivel, etc.), en lugar de adivinar, PIDE CLARIFICACIÓN al humano. Para eso, devuelve needs_clarification=true y una pregunta corta y útil.
+Recibirás el historial reciente de la conversación. Debes decidir:
+- Quién es el SIGUIENTE que debería hablar (solo UNO), o
+- Que el turno se cierre (nadie habla, se espera al humano).
 
-Tu respuesta DEBE ser un JSON válido con esta estructura EXACTA, sin texto adicional antes ni después:
+Reglas:
+1. Si el último mensaje es una pregunta directa a un agente concreto (ej. "mi pregunta a A1: ..."), convoca a ese agente.
+2. Si el último mensaje es del humano pidiendo explícitamente a un rol, convoca a ese rol.
+3. Saludos, agradecimientos, small talk triviales del humano → nadie responde (speaker=null).
+4. Pregunta técnica concreta del humano → "tl".
+5. Pregunta de alcance/prioridades del humano → "po".
+6. Pregunta sobre estrategias de trading del humano → "a1" primero (si no ha hablado aún en el tema) o "a2" (si le toca el contraturno o A1 acaba de hablar).
+7. Si los analistas están debatiendo y uno acaba de responder al otro con un punto nuevo, conviene que el otro replique UNA VEZ más para cerrar. Después, cierra el turno con speaker=null para que intervenga el PO/Jefe/Fran, NO dejes que se extiendan indefinidamente.
+8. Si detectas que el equipo está llegando a algo mediocre, conformista, o se está saltando rigor → "jefe".
+9. Si dos agentes han alcanzado consenso o una propuesta concreta, puede intervenir "po" para sintetizar. O puedes cerrar turno (speaker=null) para esperar al humano.
+10. IMPORTANTE: no permitas bucles infinitos. Tras 3-4 intercambios entre el mismo par de agentes, cierra turno.
+11. Si el último mensaje deja el tema en un punto estable o contiene una pregunta implícita al humano, cierra turno (speaker=null).
 
-Caso normal (sabes a quién convocar o nadie debe responder):
-{"speakers": ["a1", "a2"], "reasoning": "breve explicación", "needs_clarification": false, "clarification_question": ""}
+Tu respuesta DEBE ser un JSON válido con esta estructura EXACTA, sin texto adicional, sin markdown:
 
-Caso mensaje trivial (nadie responde):
-{"speakers": [], "reasoning": "mensaje trivial", "needs_clarification": false, "clarification_question": ""}
+{"speaker": "a2", "reasoning": "breve explicación", "needs_clarification": false, "clarification_question": ""}
 
-Caso ambiguo (necesitas clarificación del humano):
-{"speakers": [], "reasoning": "no queda claro el ámbito", "needs_clarification": true, "clarification_question": "¿Va dirigido al TL (técnico) o al PO (producto)?"}
+Si el turno se cierra (nadie habla a continuación):
+{"speaker": null, "reasoning": "turno cerrado, esperando al humano", "needs_clarification": false, "clarification_question": ""}
 
-IMPORTANTE: responde SOLO con el JSON, sin markdown, sin ```json, sin texto de introducción ni cierre."""
+Si el mensaje del humano es ambiguo y pides clarificación:
+{"speaker": null, "reasoning": "ambiguo", "needs_clarification": true, "clarification_question": "¿Te refieres a X o a Y?"}
+
+Responde SOLO con el JSON."""
 
 
 @dataclass
 class Decision:
-    speakers: list[str] = field(default_factory=list)
+    speaker: str | None = None            # uno solo, o None si nadie habla
     reasoning: str = ""
     needs_clarification: bool = False
     clarification_question: str = ""
 
 
-async def decide_speakers(user_message: str, context: str = "") -> Decision:
-    """
-    Dado un mensaje del usuario, decide qué roles responden y en qué orden.
-    Puede indicar que necesita clarificación del humano si el mensaje es ambiguo.
+VALID_ROLES = {"jefe", "po", "tl", "a1", "a2"}
 
-    context: opcional, historial reciente u otra info relevante que ayude a decidir.
+
+async def decide_next(history_text: str) -> Decision:
     """
-    prompt = user_message
-    if context:
-        prompt = f"Contexto reciente:\n{context}\n\nMensaje nuevo del humano:\n{user_message}"
+    Dado el historial reciente (serializado como texto), decide quién habla a continuación
+    o si el turno se cierra.
+    """
+    prompt = (
+        f"Historial reciente del canal (orden cronológico):\n"
+        f"{history_text}\n\n"
+        f"¿Quién debería hablar a continuación? ¿O cierras el turno?"
+    )
 
     response = await run_claude(
         prompt=prompt,
@@ -74,7 +85,6 @@ async def decide_speakers(user_message: str, context: str = "") -> Decision:
 
     raw = response.result.strip()
 
-    # Limpieza defensiva por si el modelo envuelve en markdown pese al prompt
     if raw.startswith("```"):
         raw = raw.strip("`")
         if raw.startswith("json"):
@@ -86,7 +96,7 @@ async def decide_speakers(user_message: str, context: str = "") -> Decision:
     except json.JSONDecodeError:
         logger.error(f"Decisor devolvió JSON inválido: {raw[:300]}")
         return Decision(
-            speakers=[],
+            speaker=None,
             reasoning="parse_error",
             needs_clarification=True,
             clarification_question=(
@@ -96,15 +106,13 @@ async def decide_speakers(user_message: str, context: str = "") -> Decision:
             ),
         )
 
-    speakers = data.get("speakers", [])
-    if not isinstance(speakers, list):
-        speakers = []
-
-    valid_ids = {"jefe", "po", "tl", "a1", "a2"}
-    speakers = [s for s in speakers if s in valid_ids]
+    speaker = data.get("speaker")
+    if speaker is not None and speaker not in VALID_ROLES:
+        logger.warning(f"Decisor devolvió speaker inválido: {speaker}")
+        speaker = None
 
     return Decision(
-        speakers=speakers,
+        speaker=speaker,
         reasoning=data.get("reasoning", ""),
         needs_clarification=bool(data.get("needs_clarification", False)),
         clarification_question=data.get("clarification_question", ""),
