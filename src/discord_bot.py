@@ -3,18 +3,10 @@ import discord
 from discord.ext import commands
 
 from src.config import settings
-from src.claude_runner import run_claude
+from src.history import init_db
+from src.team import handle_user_message
 
 logger = logging.getLogger(__name__)
-
-
-ORCHESTRATOR_SYSTEM_PROMPT = """Eres el Orquestador de un equipo de desarrollo de software \
-especializado en sistemas de trading. Tu rol es dirigir un equipo compuesto por Jefe de Proyecto, \
-Product Owner, Tech Lead y dos Analistas de trading.
-
-Por ahora solo estás validando la conexión. Responde al usuario de forma breve y profesional, \
-confirmando que has recibido su mensaje y dando un apunte útil si procede. No inventes que has \
-consultado a otros miembros del equipo — aún no están activos. Máximo 3 frases."""
 
 
 def build_bot() -> commands.Bot:
@@ -26,6 +18,7 @@ def build_bot() -> commands.Bot:
 
     @bot.event
     async def on_ready():
+        init_db()
         logger.info(f"Bot conectado como {bot.user} (id={bot.user.id})")
         guild = bot.get_guild(settings.discord_guild_id)
         if guild:
@@ -35,31 +28,41 @@ def build_bot() -> commands.Bot:
 
     @bot.event
     async def on_message(message: discord.Message):
+        # Ignorar mensajes del propio bot
         if message.author == bot.user:
             return
+        # Ignorar mensajes procedentes de webhooks (los propios agentes)
         if message.webhook_id is not None:
             return
+        # Ignorar mensajes de otros bots
+        if message.author.bot:
+            return
+        # Solo atendemos #lobby por ahora
         if message.channel.id != settings.discord_lobby_channel_id:
+            return
+        # Ignorar mensajes vacíos (ej. adjuntos sin texto)
+        if not message.content.strip():
             return
 
         logger.info(f"Mensaje de {message.author.name}: {message.content}")
 
+        async def notify_clarification(question: str) -> None:
+            await message.channel.send(f"🤔 {question}")
+
         async with message.channel.typing():
             try:
-                response = await run_claude(
-                    prompt=message.content,
-                    model="haiku",
-                    system_prompt=ORCHESTRATOR_SYSTEM_PROMPT,
+                result = await handle_user_message(
+                    user_name=message.author.display_name or message.author.name,
+                    user_id=str(message.author.id),
+                    content=message.content,
+                    notify_clarification=notify_clarification,
                 )
-                reply = response.result or "(Respuesta vacía)"
                 logger.info(
-                    f"Respuesta generada ({response.input_tokens} in / "
-                    f"{response.output_tokens} out / ${response.cost_usd:.4f})"
+                    f"Turno completo: speakers={result.speakers_invoked} "
+                    f"clarify={result.needs_clarification}"
                 )
             except Exception as e:
-                logger.exception("Error llamando a Claude Code")
-                reply = f"⚠️ Error interno: {e}"
-
-        await message.channel.send(reply)
+                logger.exception("Error en handle_user_message")
+                await message.channel.send(f"⚠️ Error interno: {e}")
 
     return bot
