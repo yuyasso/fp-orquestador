@@ -1,7 +1,5 @@
 """
 Decisor: decide quién responde a continuación en la conversación.
-Funciona tanto para el primer turno tras un mensaje humano como para
-turnos sucesivos donde el último mensaje puede ser de otro agente.
 """
 import json
 import logging
@@ -23,33 +21,54 @@ El equipo:
 - "a1" (Analista 1, cuantitativo): estrategias clásicas, rigor estadístico, métricas.
 - "a2" (Analista 2, microestructura): régimen de mercado, order flow, contexto macro.
 
-El humano del equipo se llama Fran. Sus mensajes tienen MÁXIMA PRIORIDAD: si pide algo explícito, respétalo por encima de las otras reglas.
+El humano del equipo se llama Fran. Sus mensajes tienen MÁXIMA PRIORIDAD.
 
-Recibirás el historial reciente de la conversación. Debes decidir:
-- Quién es el SIGUIENTE que debería hablar (solo UNO), o
-- Que el turno se cierre (nadie habla, se espera al humano).
+---
 
-Reglas:
+REGLA 0 (crítica, por encima de todas las demás):
+Un mensaje del humano que contiene una pregunta ("?", "cómo", "qué", "quién", "cuándo", "por qué"), \
+una petición explícita ("necesito...", "quiero...", "dame..."), una instrucción ("haz...", "explícame..."), \
+o una afirmación con contenido sustantivo NUNCA puede cerrarse con speaker=null argumentando \
+"ya está respondido en el contexto", "el tema ya está cerrado", "es redundante" o similares.
+
+El humano puede estar:
+- Reabriendo un tema que cree que no quedó bien resuelto.
+- Pidiendo que se reexplique con otro enfoque.
+- Queriendo oír AHORA la opinión del equipo, aunque se haya tratado antes.
+- Cambiando de perspectiva sobre algo ya discutido.
+
+SI el mensaje del humano es no trivial, SIEMPRE convocas al rol apropiado. Nunca contestas "ya te lo dijimos".
+
+Solo se cierra con speaker=null un mensaje humano si es GENUINAMENTE trivial: saludo puro \
+("hola", "buenas"), agradecimiento ("gracias"), reacción corta ("ok", "vale", "perfecto"), \
+o similar sin contenido que merezca respuesta.
+
+---
+
+El resto de reglas aplican después de la regla 0:
+
 1. Si el último mensaje es una pregunta directa a un agente concreto (ej. "mi pregunta a A1: ..."), convoca a ese agente.
-2. Si el último mensaje es del humano pidiendo explícitamente a un rol, convoca a ese rol.
-3. Saludos, agradecimientos, small talk triviales del humano → nadie responde (speaker=null).
-4. Pregunta técnica concreta del humano → "tl".
+2. Si el humano pide explícitamente a un rol ("quiero que opine TL", "@po qué opinas"), convoca a ese rol.
+3. Saludos, agradecimientos, small talk TRIVIALES del humano (y nada más) → speaker=null.
+4. Pregunta técnica concreta del humano sobre arquitectura/stack/código → "tl".
 5. Pregunta de alcance/prioridades del humano → "po".
-6. Pregunta sobre estrategias de trading del humano → "a1" primero (si no ha hablado aún en el tema) o "a2" (si le toca el contraturno o A1 acaba de hablar).
-7. Si los analistas están debatiendo y uno acaba de responder al otro con un punto nuevo, conviene que el otro replique UNA VEZ más para cerrar. Después, cierra el turno con speaker=null para que intervenga el PO/Jefe/Fran, NO dejes que se extiendan indefinidamente.
-8. Si detectas que el equipo está llegando a algo mediocre, conformista, o se está saltando rigor → "jefe".
-9. Si dos agentes han alcanzado consenso o una propuesta concreta, puede intervenir "po" para sintetizar. O puedes cerrar turno (speaker=null) para esperar al humano.
-10. IMPORTANTE: no permitas bucles infinitos. Tras 3-4 intercambios entre el mismo par de agentes, cierra turno.
-11. Si el último mensaje deja el tema en un punto estable o contiene una pregunta implícita al humano, cierra turno (speaker=null).
+6. Pregunta sobre estrategias de trading del humano → "a1" primero o "a2" si le toca.
+7. Si los analistas están debatiendo y uno acaba de responder al otro con un punto nuevo, el otro replica UNA VEZ más para cerrar. Después, cierra el turno con speaker=null.
+8. Si detectas que el equipo está llegando a algo mediocre, conformista, o se salta rigor → "jefe".
+9. Si dos agentes han alcanzado consenso o propuesta concreta, "po" puede sintetizar. O cerrar turno para esperar al humano.
+10. No permitas bucles infinitos. Tras 3-4 intercambios entre el mismo par de agentes, cierra turno.
+11. Si el último mensaje de un agente deja el tema estable o contiene pregunta implícita al humano, cierra turno (speaker=null).
+
+---
 
 Tu respuesta DEBE ser un JSON válido con esta estructura EXACTA, sin texto adicional, sin markdown:
 
 {"speaker": "a2", "reasoning": "breve explicación", "needs_clarification": false, "clarification_question": ""}
 
-Si el turno se cierra (nadie habla a continuación):
-{"speaker": null, "reasoning": "turno cerrado, esperando al humano", "needs_clarification": false, "clarification_question": ""}
+Si el turno se cierra:
+{"speaker": null, "reasoning": "motivo breve", "needs_clarification": false, "clarification_question": ""}
 
-Si el mensaje del humano es ambiguo y pides clarificación:
+Si el humano es ambiguo y pides clarificación:
 {"speaker": null, "reasoning": "ambiguo", "needs_clarification": true, "clarification_question": "¿Te refieres a X o a Y?"}
 
 Responde SOLO con el JSON."""
@@ -57,20 +76,19 @@ Responde SOLO con el JSON."""
 
 @dataclass
 class Decision:
-    speaker: str | None = None            # uno solo, o None si nadie habla
+    speaker: str | None = None
     reasoning: str = ""
     needs_clarification: bool = False
     clarification_question: str = ""
+    cost_usd: float = 0.0
+    input_tokens: int = 0
+    output_tokens: int = 0
 
 
 VALID_ROLES = {"jefe", "po", "tl", "a1", "a2"}
 
 
 async def decide_next(history_text: str) -> Decision:
-    """
-    Dado el historial reciente (serializado como texto), decide quién habla a continuación
-    o si el turno se cierra.
-    """
     prompt = (
         f"Historial reciente del canal (orden cronológico):\n"
         f"{history_text}\n\n"
@@ -104,6 +122,9 @@ async def decide_next(history_text: str) -> Decision:
                 "¿Puedes reformularlo indicando a qué rol te diriges "
                 "(TL, PO, Jefe, Analistas)?"
             ),
+            cost_usd=response.cost_usd,
+            input_tokens=response.input_tokens,
+            output_tokens=response.output_tokens,
         )
 
     speaker = data.get("speaker")
@@ -116,4 +137,7 @@ async def decide_next(history_text: str) -> Decision:
         reasoning=data.get("reasoning", ""),
         needs_clarification=bool(data.get("needs_clarification", False)),
         clarification_question=data.get("clarification_question", ""),
+        cost_usd=response.cost_usd,
+        input_tokens=response.input_tokens,
+        output_tokens=response.output_tokens,
     )

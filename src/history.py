@@ -1,7 +1,5 @@
 """
 Persistencia del historial de mensajes del canal #lobby en SQLite.
-Todos los mensajes (humanos y de agentes) se guardan y se pueden consultar
-como ventana deslizante para construir el contexto de las llamadas.
 """
 import sqlite3
 import logging
@@ -17,10 +15,10 @@ DB_PATH = Path(__file__).resolve().parent.parent / "orquestador.db"
 @dataclass
 class Message:
     id: int
-    timestamp: str          # ISO 8601 UTC
-    author_kind: str        # 'human' | 'agent'
-    author_name: str        # ej. "Fran", "Tech Lead", "Analista 1"
-    author_id: str          # discord user_id (humanos) o role_id (agentes)
+    timestamp: str
+    author_kind: str
+    author_name: str
+    author_id: str
     content: str
 
 
@@ -31,7 +29,6 @@ def _connect() -> sqlite3.Connection:
 
 
 def init_db() -> None:
-    """Crea la tabla si no existe. Idempotente."""
     with _connect() as conn:
         conn.execute(
             """
@@ -57,7 +54,6 @@ def save_message(
     author_id: str,
     content: str,
 ) -> int:
-    """Guarda un mensaje y devuelve su id."""
     assert author_kind in ("human", "agent"), f"author_kind inválido: {author_kind}"
     ts = datetime.now(timezone.utc).isoformat()
     with _connect() as conn:
@@ -72,7 +68,6 @@ def save_message(
 
 
 def get_recent_messages(limit: int = 20) -> list[Message]:
-    """Devuelve los últimos `limit` mensajes en orden cronológico ascendente."""
     with _connect() as conn:
         rows = conn.execute(
             """
@@ -84,13 +79,28 @@ def get_recent_messages(limit: int = 20) -> list[Message]:
             (limit,),
         ).fetchall()
     msgs = [Message(**dict(row)) for row in rows]
-    msgs.reverse()  # cronológico ascendente
+    msgs.reverse()
     return msgs
 
 
 def format_context(messages: list[Message]) -> str:
-    """Serializa una lista de mensajes en texto plano para incluir como contexto."""
     lines = []
     for m in messages:
         lines.append(f"[{m.author_name}]: {m.content}")
     return "\n".join(lines)
+
+
+def clear_all() -> int:
+    """Borra todos los mensajes de la BD. Devuelve el nº de filas borradas."""
+    with _connect() as conn:
+        cur = conn.execute("DELETE FROM messages")
+        deleted = cur.rowcount
+        conn.execute("DELETE FROM sqlite_sequence WHERE name='messages'")
+    logger.info(f"BD limpiada: {deleted} mensajes borrados")
+    return deleted
+
+
+def count_messages() -> int:
+    with _connect() as conn:
+        row = conn.execute("SELECT COUNT(*) AS n FROM messages").fetchone()
+    return int(row["n"]) if row else 0

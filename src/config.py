@@ -8,6 +8,8 @@ class Settings(BaseSettings):
     discord_guild_id: int
     discord_lobby_channel_id: int
     discord_anuncios_channel_id: int
+    discord_logs_channel_id: int
+    discord_presupuesto_channel_id: int
     discord_my_user_id: int
 
     discord_webhook_jefe: str

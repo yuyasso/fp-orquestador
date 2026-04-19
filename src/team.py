@@ -1,14 +1,5 @@
 """
-Orquestación del equipo con máquina de fases.
-
-Flujo:
-- Mensaje humano llega → Decisor inicial clasifica.
-- Si la decisión es "analítica" (convoca A1 o A2) → activa máquina de fases:
-  ANALYSIS → SYNTHESIS → REVIEW → IDLE (o vuelta a ANALYSIS si Jefe rechaza).
-- Si la decisión es puntual (TL, PO solo, o Jefe solo sin contexto de análisis) →
-  ruta corta: ese rol habla una vez y fin.
-- Si el Decisor pide clarificación → se le pregunta al humano.
-- Si el Decisor cierra sin speaker → silencio.
+Orquestación del equipo con máquina de fases + logging a canales.
 """
 import asyncio
 import logging
@@ -32,34 +23,37 @@ from src.phases import (
 )
 from src.roles import ALL_ROLES, Role
 from src.webhooks import post_as_role
+from src import channel_logger, state
 
 logger = logging.getLogger(__name__)
 
 
 CONTEXT_WINDOW = 20
-MAX_PHASE_ITERATIONS = 12  # salvaguarda absoluta del bucle de fases
+MAX_PHASE_ITERATIONS = 12
 
 
 @dataclass
 class TurnResult:
-    route: str = ""                      # "analytical" | "shortcut" | "silent" | "clarification"
+    route: str = ""
     speakers_invoked: list[str] = field(default_factory=list)
     phases_visited: list[str] = field(default_factory=list)
     halted_reason: str = ""
     needs_clarification: bool = False
     clarification_question: str = ""
+    total_cost_usd: float = 0.0
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
 
 
 def _is_analytical_decision(decision: Decision) -> bool:
-    """
-    Determina si la decisión inicial debe activar la máquina de fases.
-    Criterio: el Decisor ha convocado a un Analista (A1 o A2).
-    """
     return decision.speaker in ("a1", "a2")
 
 
-async def _run_agent(role: Role, history_text: str, extra_instruction: str = "") -> str:
-    """Genera la respuesta de un agente dado el historial y una instrucción opcional de fase."""
+async def _run_agent(
+    role: Role,
+    history_text: str,
+    extra_instruction: str = "",
+) -> tuple[str, float, int, int]:
     prompt_parts = [
         f"Historial reciente del canal (orden cronológico):\n{history_text}",
         "",
@@ -87,7 +81,14 @@ async def _run_agent(role: Role, history_text: str, extra_instruction: str = "")
         f"${response.cost_usd:.4f})"
     )
 
-    return (response.result or "").strip() or "(sin respuesta)"
+    await channel_logger.budget(
+        f"💬 **{role.display_name}** ({role.model}): "
+        f"${response.cost_usd:.4f} "
+        f"· {response.input_tokens} in / {response.output_tokens} out"
+    )
+
+    text = (response.result or "").strip() or "(sin respuesta)"
+    return text, response.cost_usd, response.input_tokens, response.output_tokens
 
 
 async def _publish_and_save(role: Role, content: str) -> None:
@@ -104,12 +105,14 @@ async def _publish_and_save(role: Role, content: str) -> None:
 
 
 async def _run_analytical_flow(initial_decision: Decision) -> TurnResult:
-    """Ejecuta la máquina de fases: ANALYSIS → SYNTHESIS → REVIEW."""
     result = TurnResult(route="analytical")
-    state = PhaseState(phase=Phase.ANALYSIS)
+    # Arrastramos el coste del Decisor inicial
+    result.total_cost_usd += initial_decision.cost_usd
+    result.total_input_tokens += initial_decision.input_tokens
+    result.total_output_tokens += initial_decision.output_tokens
 
-    # Primer analista lo marca el Decisor inicial (a1 o a2). Sesga el arranque.
-    first_speaker_hint = initial_decision.speaker  # "a1" o "a2"
+    state = PhaseState(phase=Phase.ANALYSIS)
+    first_speaker_hint = initial_decision.speaker
 
     iterations = 0
     while iterations < MAX_PHASE_ITERATIONS:
@@ -120,13 +123,12 @@ async def _run_analytical_flow(initial_decision: Decision) -> TurnResult:
             last_message_author=None,
         )
 
-        # En la primera iteración, si el Decisor sugirió A2, arrancamos con A2 en vez de A1
         if iterations == 1 and action.kind == "speak" and first_speaker_hint in ("a1", "a2"):
             action = PhaseAction(
                 kind="speak",
                 speaker=first_speaker_hint,
                 instruction=action.instruction,
-                reason=action.reason + f" (arranque sesgado por Decisor: {first_speaker_hint})",
+                reason=action.reason + f" (arranque sesgado: {first_speaker_hint})",
             )
 
         logger.info(
@@ -141,6 +143,9 @@ async def _run_analytical_flow(initial_decision: Decision) -> TurnResult:
             return result
 
         if action.kind == "transition" and action.next_phase:
+            await channel_logger.log(
+                f"🔄 `{state.phase.value}` → `{action.next_phase.value}` · {action.reason}"
+            )
             apply_transition(state, action.next_phase)
             continue
 
@@ -154,8 +159,17 @@ async def _run_analytical_flow(initial_decision: Decision) -> TurnResult:
             recent = get_recent_messages(limit=CONTEXT_WINDOW)
             history_text = format_context(recent)
 
+            await channel_logger.log(
+                f"🎤 `{state.phase.value}` → **{role.display_name}** habla"
+            )
+
             try:
-                reply = await _run_agent(role, history_text, action.instruction)
+                reply, cost, tin, tout = await _run_agent(
+                    role, history_text, action.instruction
+                )
+                result.total_cost_usd += cost
+                result.total_input_tokens += tin
+                result.total_output_tokens += tout
             except Exception as e:
                 logger.exception(f"Error generando respuesta de {role.display_name}")
                 reply = f"(Error interno en {role.display_name}: {e})"
@@ -163,7 +177,6 @@ async def _run_analytical_flow(initial_decision: Decision) -> TurnResult:
             await _publish_and_save(role, reply)
             result.speakers_invoked.append(role.id)
 
-            # Post-efectos según rol/fase
             if state.phase == Phase.ANALYSIS:
                 register_agent_turn(state, role.id)
             elif state.phase == Phase.SYNTHESIS:
@@ -176,11 +189,11 @@ async def _run_analytical_flow(initial_decision: Decision) -> TurnResult:
                         else "jefe_rejected_max" if state.rejection_count >= 2
                         else "jefe_implicit_close"
                     )
-                    if state.phase.value not in result.phases_visited:
-                        result.phases_visited.append(state.phase.value)
                     return result
                 else:
-                    # rechazo con margen → vuelve a ANALYSIS
+                    await channel_logger.log(
+                        f"↩️ Jefe rechazó (rechazos: {state.rejection_count}/2) → volvemos a ANALYSIS"
+                    )
                     apply_transition(state, Phase.ANALYSIS)
 
             await asyncio.sleep(0.8)
@@ -192,8 +205,12 @@ async def _run_analytical_flow(initial_decision: Decision) -> TurnResult:
 
 
 async def _run_shortcut(initial_decision: Decision) -> TurnResult:
-    """Ruta rápida: un único rol responde una vez."""
     result = TurnResult(route="shortcut")
+    # Arrastramos el coste del Decisor inicial
+    result.total_cost_usd += initial_decision.cost_usd
+    result.total_input_tokens += initial_decision.input_tokens
+    result.total_output_tokens += initial_decision.output_tokens
+
     speaker_id = initial_decision.speaker
     role = ALL_ROLES.get(speaker_id) if speaker_id else None
     if role is None:
@@ -203,8 +220,13 @@ async def _run_shortcut(initial_decision: Decision) -> TurnResult:
     recent = get_recent_messages(limit=CONTEXT_WINDOW)
     history_text = format_context(recent)
 
+    await channel_logger.log(f"🎤 Shortcut → **{role.display_name}** habla")
+
     try:
-        reply = await _run_agent(role, history_text)
+        reply, cost, tin, tout = await _run_agent(role, history_text)
+        result.total_cost_usd += cost
+        result.total_input_tokens += tin
+        result.total_output_tokens += tout
     except Exception as e:
         logger.exception(f"Error generando respuesta de {role.display_name}")
         reply = f"(Error interno en {role.display_name}: {e})"
@@ -215,16 +237,27 @@ async def _run_shortcut(initial_decision: Decision) -> TurnResult:
     return result
 
 
+async def _finalize_turn(result: TurnResult) -> TurnResult:
+    """Emite el resumen de fin de turno en #logs y #presupuesto y devuelve result."""
+    await channel_logger.log(
+        f"✅ Turno cerrado: `{result.halted_reason}` · "
+        f"speakers={result.speakers_invoked} · fases={result.phases_visited}"
+    )
+    await channel_logger.budget(
+        f"💰 **Turno completo** ({result.route}): "
+        f"${result.total_cost_usd:.4f} · "
+        f"{len(result.speakers_invoked)} intervenciones · "
+        f"{result.total_input_tokens} in / {result.total_output_tokens} out"
+    )
+    return result
+
+
 async def handle_user_message(
     user_name: str,
     user_id: str,
     content: str,
-    notify_clarification,  # callable async (str) -> None
+    notify_clarification,
 ) -> TurnResult:
-    """
-    Punto de entrada. Decide ruta corta vs analítica según el Decisor inicial.
-    """
-    # 1. Guardar el mensaje humano
     save_message(
         author_kind="human",
         author_name=user_name,
@@ -232,7 +265,13 @@ async def handle_user_message(
         content=content,
     )
 
-    # 2. Decisor inicial
+    # Si el orquestador está pausado, no convocamos a nadie.
+    if state.is_paused():
+        await channel_logger.log(
+            f"⏸️ Mensaje recibido con orquestador PAUSADO. Mensaje guardado pero sin respuesta."
+        )
+        return TurnResult(route="paused", halted_reason="orchestrator_paused")
+
     recent = get_recent_messages(limit=CONTEXT_WINDOW)
     history_text = format_context(recent)
     decision = await decide_next(history_text)
@@ -240,30 +279,49 @@ async def handle_user_message(
     logger.info(
         f"[decisor_inicial] speaker={decision.speaker} "
         f"clarify={decision.needs_clarification} "
-        f"reasoning={decision.reasoning!r}"
+        f"reasoning={decision.reasoning!r} "
+        f"cost=${decision.cost_usd:.4f}"
+    )
+    await channel_logger.log(
+        f"🧭 **Decisor inicial** → speaker=`{decision.speaker}` · {decision.reasoning[:200]}"
+    )
+    await channel_logger.budget(
+        f"🧭 **Decisor** (haiku): ${decision.cost_usd:.4f} · "
+        f"{decision.input_tokens} in / {decision.output_tokens} out"
     )
 
-    # 3. Clarificación
+    # Clarificación
     if decision.needs_clarification and decision.clarification_question:
         await notify_clarification(decision.clarification_question)
-        return TurnResult(
+        result = TurnResult(
             route="clarification",
             needs_clarification=True,
             clarification_question=decision.clarification_question,
             halted_reason="clarification",
+            total_cost_usd=decision.cost_usd,
+            total_input_tokens=decision.input_tokens,
+            total_output_tokens=decision.output_tokens,
         )
+        return await _finalize_turn(result)
 
-    # 4. Sin speaker → silencio
+    # Silencio
     if decision.speaker is None:
-        return TurnResult(
+        await channel_logger.log("🤐 Sin speaker: silencio")
+        result = TurnResult(
             route="silent",
             halted_reason="no_speaker",
+            total_cost_usd=decision.cost_usd,
+            total_input_tokens=decision.input_tokens,
+            total_output_tokens=decision.output_tokens,
         )
+        return await _finalize_turn(result)
 
-    # 5. Enrutado: analítico vs shortcut
+    # Analítica vs shortcut
     if _is_analytical_decision(decision):
-        logger.info("Ruta: ANALÍTICA (máquina de fases)")
-        return await _run_analytical_flow(decision)
+        await channel_logger.log("🧠 Ruta: **ANALÍTICA** (máquina de fases)")
+        result = await _run_analytical_flow(decision)
     else:
-        logger.info(f"Ruta: SHORTCUT ({decision.speaker})")
-        return await _run_shortcut(decision)
+        await channel_logger.log(f"⚡ Ruta: **SHORTCUT** ({decision.speaker})")
+        result = await _run_shortcut(decision)
+
+    return await _finalize_turn(result)
