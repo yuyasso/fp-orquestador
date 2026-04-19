@@ -5,7 +5,7 @@ from discord.ext import commands
 from src.config import settings
 from src.history import init_db
 from src.team import handle_user_message
-from src import channel_logger
+from src import channel_logger, team as _team_module
 from src.commands import register_commands
 
 logger = logging.getLogger(__name__)
@@ -18,6 +18,7 @@ def build_bot() -> commands.Bot:
 
     bot = commands.Bot(command_prefix="!", intents=intents)
     channel_logger.init(bot)
+    _team_module.set_bot(bot)
     register_commands(bot)
 
     @bot.event

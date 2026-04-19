@@ -1,3 +1,4 @@
+from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -17,6 +18,8 @@ class Settings(BaseSettings):
     discord_webhook_tl: str
     discord_webhook_a1: str
     discord_webhook_a2: str
+
+    trading_repo_path: Path
 
 
 settings = Settings()
