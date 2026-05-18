@@ -30,6 +30,7 @@ class Phase(str, Enum):
     PLANNING = "PLANNING"
     AUTHORIZATION = "AUTHORIZATION"
     EXECUTION = "EXECUTION"
+    REPORTING = "REPORTING"
 
 
 @dataclass
@@ -120,6 +121,27 @@ def decide_next_action(state: PhaseState) -> PhaseAction:
         return PhaseAction(
             kind="execute_plan",
             reason="EXECUTION → Claude Code ejecuta el plan del TL",
+        )
+
+    if state.phase == Phase.REPORTING:
+        return PhaseAction(
+            kind="speak",
+            speaker="tl",
+            instruction=(
+                "Estamos en fase REPORTING. Claude Code ha terminado la ejecución del plan que tú redactaste. "
+                "Tienes en el historial reciente el resumen técnico de lo que hizo. "
+                "Tu tarea: producir un REPORTE ESTRUCTURADO para el equipo (PO especialmente) con:\n"
+                "**Entregado:** qué se construyó realmente (módulos, archivos clave).\n"
+                "**Validaciones:** qué tests pasan, mypy/ruff/cobertura.\n"
+                "**Desviaciones del plan:** si Claude Code hizo algo distinto de lo planeado, dilo claramente.\n"
+                "**Deuda técnica:** lo que queda por hacer o pulir, sin maquillaje.\n"
+                "**Riesgos descubiertos:** problemas que aparecieron durante la implementación.\n"
+                "**Próximo paso recomendado:** qué sería lo siguiente.\n\n"
+                "Sé honesto: si algo no quedó bien, dilo. El PO va a validar contra los criterios "
+                "de aceptación que definió en SYNTHESIS — tu trabajo aquí es darle la información "
+                "que necesita para decidir, no venderle el trabajo."
+            ),
+            reason="REPORTING → TL informa al equipo",
         )
 
     return PhaseAction(kind="close", reason=f"fase desconocida: {state.phase}")

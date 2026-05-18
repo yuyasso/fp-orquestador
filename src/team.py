@@ -268,8 +268,13 @@ async def _run_analytical_flow(initial_decision: Decision) -> TurnResult:
 
         if action.kind == "execute_plan":
             await _run_execution(last_planning_reply, result)
-            result.halted_reason = f"execution_{'ok' if result.execution_success else 'failed'}"
-            return result
+            if not result.execution_success:
+                result.halted_reason = "execution_failed"
+                return result
+            # Ejecución OK → REPORTING (TL informa al equipo)
+            await channel_logger.log(f"🔄 `EXECUTION` → `REPORTING`")
+            apply_transition(state_obj, Phase.REPORTING)
+            continue
 
         if action.kind == "delegate_to_decider":
             if first_analysis_iteration and first_speaker_hint in ("a1", "a2"):
@@ -375,6 +380,11 @@ async def _run_analytical_flow(initial_decision: Decision) -> TurnResult:
                 last_planning_reply = reply
                 await channel_logger.log(f"🔄 `PLANNING` → `AUTHORIZATION`")
                 apply_transition(state_obj, Phase.AUTHORIZATION)
+            elif state_obj.phase == Phase.REPORTING:
+                # TL ya ha reportado. Cerramos turno (en Paso 3.2 vendrá ACCEPTANCE).
+                result.halted_reason = "reporting_done"
+                await channel_logger.log(f"✅ Reporting completado")
+                return result
 
             await asyncio.sleep(0.8)
             continue
