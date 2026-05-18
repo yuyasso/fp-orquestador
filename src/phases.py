@@ -29,6 +29,7 @@ class Phase(str, Enum):
     REVIEW = "REVIEW"
     PLANNING = "PLANNING"
     AUTHORIZATION = "AUTHORIZATION"
+    EXECUTION = "EXECUTION"
 
 
 @dataclass
@@ -113,6 +114,12 @@ def decide_next_action(state: PhaseState) -> PhaseAction:
         return PhaseAction(
             kind="request_authorization",
             reason="AUTHORIZATION → gate humano",
+        )
+
+    if state.phase == Phase.EXECUTION:
+        return PhaseAction(
+            kind="execute_plan",
+            reason="EXECUTION → Claude Code ejecuta el plan del TL",
         )
 
     return PhaseAction(kind="close", reason=f"fase desconocida: {state.phase}")

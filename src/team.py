@@ -32,6 +32,7 @@ from src.phases import (
 from src.roles import ALL_ROLES, Role
 from src.webhooks import post_as_role
 from src.authorization import request_authorization
+from src.claude_executor import execute_claude_code, ExecutionResult
 from src import channel_logger, state, memory
 
 logger = logging.getLogger(__name__)
@@ -62,6 +63,9 @@ class TurnResult:
     human_blocks: int = 0
     blocking_human_block: bool = False
     authorization_result: str = ""
+    execution_success: bool = False
+    execution_cost_usd: float = 0.0
+    execution_session_id: str = ""
 
 
 def _is_analytical_decision(decision: Decision) -> bool:
@@ -254,7 +258,17 @@ async def _run_analytical_flow(initial_decision: Decision) -> TurnResult:
 
             decision_auth = await request_authorization(channel, last_planning_reply or "(plan no capturado)")
             result.authorization_result = decision_auth
-            result.halted_reason = f"authorization_{decision_auth}"
+            if decision_auth != "authorized":
+                result.halted_reason = f"authorization_{decision_auth}"
+                return result
+            # Autorizada → pasamos a EXECUTION
+            await channel_logger.log(f"🔄 `AUTHORIZATION` → `EXECUTION` · plan aprobado")
+            apply_transition(state_obj, Phase.EXECUTION)
+            continue
+
+        if action.kind == "execute_plan":
+            await _run_execution(last_planning_reply, result)
+            result.halted_reason = f"execution_{'ok' if result.execution_success else 'failed'}"
             return result
 
         if action.kind == "delegate_to_decider":
@@ -424,6 +438,149 @@ async def _finalize_turn(result: TurnResult) -> TurnResult:
         f"{result.total_input_tokens} in / {result.total_output_tokens} out"
     )
     return result
+
+
+async def _run_execution(plan_text: str, result: TurnResult) -> None:
+    """
+    Invoca Claude Code para ejecutar el plan del TL en el repo de trading.
+    Eventos en tiempo real → #claude-code.
+    Resumen final firmado por el TL → #lobby (vía webhook).
+    """
+    from src.roles import TECH_LEAD
+
+    cwd = settings.trading_repo_path
+
+    await channel_logger.log(
+        f"⚙️ **EXECUTION** arrancando en `{cwd}`"
+    )
+
+    # Canal #claude-code para streaming de eventos técnicos
+    claude_code_channel = None
+    if _bot_ref is not None:
+        from src.config import settings as _s
+        # Reutilizamos el discord_logs_channel_id como fallback si no hay #claude-code configurado
+        claude_code_channel = _bot_ref.get_channel(_s.discord_logs_channel_id)
+
+    # Anuncio en #lobby de inicio
+    if _bot_ref is not None:
+        lobby = _bot_ref.get_channel(settings.discord_lobby_channel_id)
+        if lobby is not None:
+            await lobby.send(
+                f"⚙️ **Claude Code arrancando** — implementando el plan del Tech Lead. "
+                f"Sigue los detalles técnicos en #logs."
+            )
+
+    async def on_event(event: dict) -> None:
+        etype = event.get("type")
+        if etype == "start":
+            sid = event.get("session_id", "")
+            await channel_logger.log(
+                f"🟢 **Claude Code START** · session=`{sid[:8]}` · model=`{event.get('model', '')}`"
+            )
+        elif etype == "tool_use":
+            name = event.get("tool_name", "")
+            inp = event.get("tool_input", {}) or {}
+            summary = _summarize_tool_input(name, inp)
+            await channel_logger.log(f"🔨 `{name}` · {summary}")
+        elif etype == "tool_result":
+            is_err = event.get("is_error", False)
+            content_sum = event.get("content_summary", "")
+            icon = "❌" if is_err else "✅"
+            await channel_logger.log(f"{icon} resultado · {content_sum[:200]}")
+        elif etype == "text":
+            text = event.get("text", "").strip()
+            if text:
+                await channel_logger.log(f"💬 Claude: {text[:300]}")
+        elif etype == "error":
+            await channel_logger.log(f"🔴 Error en ejecución: {event.get('message', '')}")
+        # thinking: silenciado en #logs
+
+    # Disallowlist mínima de cosas peligrosas
+    disallowed = [
+        "Bash(sudo *)",
+        "Bash(rm -rf /*)",
+        "Bash(rm -rf ~*)",
+        "Bash(git push --force*)",
+        "Bash(git push -f*)",
+    ]
+
+    exec_result: ExecutionResult = await execute_claude_code(
+        prompt=plan_text,
+        cwd=cwd,
+        on_event=on_event,
+        model="sonnet",
+        disallowed_tools=disallowed,
+        skip_permissions=True,
+    )
+
+    # Acumular coste y registrar
+    result.execution_success = exec_result.success
+    result.execution_cost_usd = exec_result.cost_usd
+    result.execution_session_id = exec_result.session_id
+    result.total_cost_usd += exec_result.cost_usd
+    result.total_input_tokens += exec_result.input_tokens
+    result.total_output_tokens += exec_result.output_tokens
+
+    await channel_logger.budget(
+        f"⚙️ **Claude Code ejecución**: ${exec_result.cost_usd:.4f} · "
+        f"{exec_result.input_tokens} in / {exec_result.output_tokens} out · "
+        f"{exec_result.duration_ms / 1000:.1f}s · {exec_result.num_turns} turnos"
+    )
+
+    # Resumen final firmado por el TL en #lobby
+    if exec_result.success:
+        summary_msg = (
+            f"✅ **Ejecución completada.**\n\n"
+            f"{exec_result.result_text[:1500]}\n\n"
+            f"_Detalles técnicos en #logs · sesión `{exec_result.session_id[:8]}`._"
+        )
+    else:
+        summary_msg = (
+            f"❌ **La ejecución ha fallado.**\n\n"
+            f"Error: {exec_result.error or 'sin detalle'}\n\n"
+            f"_Detalles técnicos en #logs._"
+        )
+
+    try:
+        await post_as_role(TECH_LEAD, summary_msg)
+    except Exception:
+        logger.exception("Error publicando resumen de ejecución")
+
+    # Guardar el resumen en el historial conversacional
+    save_message(
+        author_kind="agent",
+        author_name=TECH_LEAD.display_name,
+        author_id=TECH_LEAD.id,
+        content=summary_msg,
+    )
+
+    await channel_logger.log(
+        f"⚙️ **EXECUTION terminada** · success={exec_result.success} · "
+        f"events={exec_result.events_count}"
+    )
+
+
+def _summarize_tool_input(name: str, inp: dict) -> str:
+    """Resume el input de una tool en una línea legible."""
+    if name == "Write" or name == "Edit":
+        path = inp.get("file_path", "?")
+        return f"`{path}`"
+    if name == "Read":
+        path = inp.get("file_path") or inp.get("path", "?")
+        return f"`{path}`"
+    if name == "Bash":
+        cmd = inp.get("command", "")
+        return f"`{cmd[:120]}`"
+    if name == "Glob":
+        pattern = inp.get("pattern", "")
+        path = inp.get("path", "")
+        return f"`{pattern}` en `{path}`"
+    if name == "Grep":
+        pattern = inp.get("pattern", "")
+        return f"`{pattern}`"
+    # Genérico
+    short = str(inp)[:120]
+    return short
 
 
 async def handle_user_message(
