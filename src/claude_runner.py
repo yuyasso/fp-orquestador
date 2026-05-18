@@ -23,7 +23,7 @@ async def run_claude(
     model: str = "sonnet",
     system_prompt: Optional[str] = None,
     session_id: Optional[str] = None,
-    timeout_seconds: int = 120,
+    timeout_seconds: int = 300,
 ) -> ClaudeResponse:
     """
     Invoca claude-code en modo headless y devuelve la respuesta parseada.
