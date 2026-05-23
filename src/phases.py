@@ -31,6 +31,7 @@ class Phase(str, Enum):
     AUTHORIZATION = "AUTHORIZATION"
     EXECUTION = "EXECUTION"
     REPORTING = "REPORTING"
+    ACCEPTANCE = "ACCEPTANCE"
 
 
 @dataclass
@@ -123,6 +124,34 @@ def decide_next_action(state: PhaseState) -> PhaseAction:
             reason="EXECUTION → Claude Code ejecuta el plan del TL",
         )
 
+    if state.phase == Phase.ACCEPTANCE:
+        return PhaseAction(
+            kind="speak",
+            speaker="po",
+            instruction=(
+                "Estamos en fase ACCEPTANCE. El Tech Lead ha entregado el trabajo y "
+                "ha presentado el reporte. Tienes en el historial los criterios de aceptación "
+                "que TU MISMO definiste en SYNTHESIS y el reporte del TL.\n\n"
+                "Tu tarea: VALIDAR formalmente la entrega contra esos criterios.\n\n"
+                "FORMATO OBLIGATORIO DE TU MENSAJE:\n"
+                "- Tu mensaje DEBE empezar con UNA SOLA etiqueta como primer elemento: "
+                "[ACEPTADO] o [RECHAZADO].\n"
+                "- [ACEPTADO] significa que TODOS los criterios de aceptacion se cumplen sin "
+                "excepciones. No existen medias tintas, no existe 'aceptado con condiciones'.\n"
+                "- [RECHAZADO] cuando CUALQUIER criterio no se cumpla, haya desviaciones del "
+                "plan no justificadas razonablemente, deuda tecnica inaceptable, o falte algo. "
+                "En ese caso, lista que hay que arreglar, dirigido al TL, para que itere.\n"
+                "- NO uses ambas etiquetas. NO menciones la etiqueta opuesta en mitad del texto.\n"
+                "- El sistema interpreta tu mensaje automaticamente: cualquier [RECHAZADO] se "
+                "considera rechazo aunque tambien aparezca [ACEPTADO].\n\n"
+                "Se exigente pero justo: si la entrega cumple los criterios reales, acepta sin "
+                "reservas. Si hay deuda tecnica menor pero los criterios se cumplen, acepta y "
+                "registra la deuda como trabajo futuro - no rechaces por perfeccionismo. "
+                "Si algo importante falla o se ha desviado del plan sin justificacion, rechaza."
+            ),
+            reason="ACCEPTANCE -> PO valida entrega",
+        )
+
     if state.phase == Phase.REPORTING:
         return PhaseAction(
             kind="speak",
@@ -149,6 +178,29 @@ def decide_next_action(state: PhaseState) -> PhaseAction:
 
 def apply_transition(state: PhaseState, new_phase: Phase) -> None:
     state.phase = new_phase
+
+
+def handle_po_verdict(state: PhaseState, po_reply: str) -> Phase:
+    """
+    Interpreta la respuesta del PO en ACCEPTANCE.
+
+    Reglas:
+    - [RECHAZADO] tiene prioridad sobre [ACEPTADO].
+    - [ACEPTADO] sin [RECHAZADO] -> cierre del sprint (IDLE).
+    - [RECHAZADO] -> vuelta a PLANNING (el TL itera con el feedback).
+    - Sin etiqueta clara -> cierre por defecto (IDLE).
+    """
+    text = po_reply.upper()
+    has_rejected = "[RECHAZADO]" in text
+    has_accepted = "[ACEPTADO]" in text
+
+    if has_rejected:
+        return Phase.PLANNING
+
+    if has_accepted:
+        return Phase.IDLE
+
+    return Phase.IDLE
 
 
 def handle_jefe_verdict(state: PhaseState, jefe_reply: str) -> Phase:

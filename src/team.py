@@ -28,6 +28,7 @@ from src.phases import (
     decide_next_action,
     apply_transition,
     handle_jefe_verdict,
+    handle_po_verdict,
 )
 from src.roles import ALL_ROLES, Role
 from src.webhooks import post_as_role
@@ -381,10 +382,24 @@ async def _run_analytical_flow(initial_decision: Decision) -> TurnResult:
                 await channel_logger.log(f"🔄 `PLANNING` → `AUTHORIZATION`")
                 apply_transition(state_obj, Phase.AUTHORIZATION)
             elif state_obj.phase == Phase.REPORTING:
-                # TL ya ha reportado. Cerramos turno (en Paso 3.2 vendrá ACCEPTANCE).
-                result.halted_reason = "reporting_done"
-                await channel_logger.log(f"✅ Reporting completado")
-                return result
+                # TL ya ha reportado -> ACCEPTANCE (PO valida formalmente)
+                await channel_logger.log(f"🔄 `REPORTING` -> `ACCEPTANCE`")
+                apply_transition(state_obj, Phase.ACCEPTANCE)
+            elif state_obj.phase == Phase.ACCEPTANCE:
+                next_phase = handle_po_verdict(state_obj, reply)
+                if next_phase == Phase.IDLE:
+                    # Aceptado -> sprint cerrado
+                    result.halted_reason = "accepted"
+                    await channel_logger.log(
+                        f"✅ PO **[ACEPTADO]** -> sprint cerrado"
+                    )
+                    return result
+                else:
+                    # Rechazado -> vuelta a PLANNING para iterar
+                    await channel_logger.log(
+                        f"↩️ PO **[RECHAZADO]** -> vuelta a PLANNING para iterar"
+                    )
+                    apply_transition(state_obj, Phase.PLANNING)
 
             await asyncio.sleep(0.8)
             continue
