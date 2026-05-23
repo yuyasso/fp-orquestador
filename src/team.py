@@ -33,6 +33,7 @@ from src.phases import (
 from src.roles import ALL_ROLES, Role
 from src.webhooks import post_as_role
 from src.authorization import request_authorization
+from src import memory_writer
 from src.claude_executor import execute_claude_code, ExecutionResult
 from src import channel_logger, state, memory
 
@@ -77,16 +78,29 @@ async def _run_agent(
     role: Role,
     history_text: str,
     extra_instruction: str = "",
+    include_repo_state: bool = False,
 ) -> tuple[str, float, int, int]:
     memory_block = memory.format_as_context()
 
     prompt_parts = [
         memory_block,
         "",
+    ]
+
+    # Inyectar estado real del repo solo cuando hace falta (PLANNING del TL).
+    if include_repo_state:
+        try:
+            repo_state = memory.get_repo_state_for_planning()
+            prompt_parts.append(repo_state)
+            prompt_parts.append("")
+        except Exception:
+            logger.exception("Error obteniendo estado del repo para PLANNING")
+
+    prompt_parts.extend([
         f"Historial reciente del canal (orden cronológico):\n{history_text}",
         "",
         f"Responde desde tu rol ({role.display_name}).",
-    ]
+    ])
     if extra_instruction:
         prompt_parts.append("")
         prompt_parts.append(f"Instrucción para este turno:\n{extra_instruction}")
@@ -198,12 +212,15 @@ async def _execute_agent_turn(
     role: Role,
     extra_instruction: str,
     result: TurnResult,
+    include_repo_state: bool = False,
 ) -> str:
     recent = get_recent_messages(limit=CONTEXT_WINDOW)
     history_text = format_context(recent)
 
     try:
-        reply, cost, tin, tout = await _run_agent(role, history_text, extra_instruction)
+        reply, cost, tin, tout = await _run_agent(
+            role, history_text, extra_instruction, include_repo_state=include_repo_state
+        )
         result.total_cost_usd += cost
         result.total_input_tokens += tin
         result.total_output_tokens += tout
@@ -229,6 +246,8 @@ async def _run_analytical_flow(initial_decision: Decision) -> TurnResult:
     state_obj = PhaseState(phase=Phase.ANALYSIS)
     first_speaker_hint = initial_decision.speaker
     last_planning_reply: str = ""
+    last_po_synthesis: str = ""
+    last_tl_report: str = ""
     first_analysis_iteration = True
 
     while len(result.speakers_invoked) < MAX_AGENT_TURNS_PER_TURN:
@@ -348,7 +367,15 @@ async def _run_analytical_flow(initial_decision: Decision) -> TurnResult:
             await channel_logger.log(
                 f"🎤 `{state_obj.phase.value}` → **{role.display_name}** habla"
             )
-            reply = await _execute_agent_turn(role, action.instruction, result)
+            # Inyectar estado del repo en PLANNING para que el TL no invente rutas
+            inject_repo = (state_obj.phase == Phase.PLANNING and role.id == "tl")
+            if inject_repo:
+                await channel_logger.log(
+                    f"📂 Inyectando estado real del repo al TL para PLANNING"
+                )
+            reply = await _execute_agent_turn(
+                role, action.instruction, result, include_repo_state=inject_repo
+            )
 
             # Halt por bloqueante
             if result.blocking_human_block:
@@ -361,6 +388,7 @@ async def _run_analytical_flow(initial_decision: Decision) -> TurnResult:
 
             # Transiciones tras hablar
             if state_obj.phase == Phase.SYNTHESIS:
+                last_po_synthesis = reply
                 await channel_logger.log(f"🔄 `SYNTHESIS` → `REVIEW`")
                 apply_transition(state_obj, Phase.REVIEW)
             elif state_obj.phase == Phase.REVIEW:
@@ -370,6 +398,14 @@ async def _run_analytical_flow(initial_decision: Decision) -> TurnResult:
                     return result
                 elif next_phase == Phase.PLANNING:
                     await channel_logger.log(f"🔄 `REVIEW` → `PLANNING` · Jefe validó")
+                    # Persistir la decisión validada en decisions.md
+                    try:
+                        if memory_writer.record_jefe_validation(last_po_synthesis, reply):
+                            await channel_logger.log(
+                                f"💾 `decisions.md` actualizado con la decisión validada"
+                            )
+                    except Exception:
+                        logger.exception("Error escribiendo decisions.md")
                     apply_transition(state_obj, Phase.PLANNING)
                 else:
                     await channel_logger.log(
@@ -382,7 +418,7 @@ async def _run_analytical_flow(initial_decision: Decision) -> TurnResult:
                 await channel_logger.log(f"🔄 `PLANNING` → `AUTHORIZATION`")
                 apply_transition(state_obj, Phase.AUTHORIZATION)
             elif state_obj.phase == Phase.REPORTING:
-                # TL ya ha reportado -> ACCEPTANCE (PO valida formalmente)
+                last_tl_report = reply
                 await channel_logger.log(f"🔄 `REPORTING` -> `ACCEPTANCE`")
                 apply_transition(state_obj, Phase.ACCEPTANCE)
             elif state_obj.phase == Phase.ACCEPTANCE:
@@ -393,6 +429,20 @@ async def _run_analytical_flow(initial_decision: Decision) -> TurnResult:
                     await channel_logger.log(
                         f"✅ PO **[ACEPTADO]** -> sprint cerrado"
                     )
+                    # Persistir entregable y vaciar tarea actual
+                    try:
+                        if memory_writer.record_sprint_acceptance(
+                            tl_planning=last_planning_reply,
+                            tl_report=last_tl_report,
+                            po_acceptance=reply,
+                            execution_session_id=result.execution_session_id,
+                        ):
+                            await channel_logger.log(
+                                f"💾 Memoria actualizada: `strategies_tested.md`, "
+                                f"`current_task.md`, `roadmap.md`"
+                            )
+                    except Exception:
+                        logger.exception("Error escribiendo memoria tras ACEPTADO")
                     return result
                 else:
                     # Rechazado -> vuelta a PLANNING para iterar

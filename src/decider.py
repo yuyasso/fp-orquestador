@@ -38,7 +38,24 @@ Solo se cierra con speaker=null un mensaje humano genuinamente trivial: saludo, 
 
 ---
 
-Resto de reglas:
+REGLA 1 (también crítica, ANTES que cualquier análisis de contenido):
+Si el mensaje del humano empieza con menciones explícitas a roles, RESPETA esa mención por encima de TODO análisis de contenido. Es la voluntad declarada del humano.
+
+Patrones de mención explícita al principio del mensaje (primeros ~50 caracteres):
+- "A1," / "A1:" / "A1 y A2" / "@A1" / "Analista 1" → speaker = "a1"
+- "A2," / "A2:" / "@A2" / "Analista 2" → speaker = "a2"
+- "A1 y A2" / "A1, A2" / "Analistas," → speaker = "a1" (el otro entrará después en ANALYSIS)
+- "PO," / "@PO" / "Product Owner" → speaker = "po"
+- "TL," / "@TL" / "Tech Lead" → speaker = "tl"
+- "Jefe," / "@Jefe" → speaker = "jefe"
+
+Estos patrones son PRIORIDAD ABSOLUTA. Aunque el contenido del mensaje sea técnico, arquitectónico o estratégico, NO redirijas a otro rol. El humano sabe a quién quiere convocar. Tu trabajo es respetar esa decisión, no corregirla.
+
+Solo si NO hay mención explícita al inicio, aplica las reglas 2-5 sobre análisis de contenido.
+
+---
+
+Resto de reglas (solo aplican si NO hay mención explícita al inicio):
 1. Pregunta directa a un agente concreto → ese agente.
 2. Pregunta humana sobre arquitectura/stack/código → "tl".
 3. Pregunta humana sobre alcance/prioridades/MVP → "po".
