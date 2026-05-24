@@ -201,3 +201,82 @@ def _insert_under_section(file_path: Path, section_name: str, entry: str) -> boo
     except Exception:
         logger.exception(f"Error insertando en seccion {section_name} de {file_path}")
         return False
+
+
+
+# ============================================================
+# Auto-commit del repo de trading tras ACCEPTANCE
+# ============================================================
+
+import subprocess as _sp
+
+
+def commit_and_push_repo(commit_message: str) -> tuple[bool, str]:
+    """
+    Hace git add + commit + push en el repo de trading tras [ACEPTADO].
+
+    Devuelve (success, log_text). El log es un resumen humano para Discord.
+    Nunca lanza excepciones — los errores se devuelven en el log.
+    """
+    repo_root = Path(settings.trading_repo_path).expanduser().resolve()
+    if not repo_root.exists():
+        return False, f"Repo no existe: {repo_root}"
+    if not (repo_root / ".git").exists():
+        return False, f"No es un repo git: {repo_root}"
+
+    log_parts: list[str] = []
+
+    def run(args: list[str]) -> tuple[int, str, str]:
+        try:
+            result = _sp.run(
+                args,
+                cwd=str(repo_root),
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            return result.returncode, result.stdout.strip(), result.stderr.strip()
+        except _sp.TimeoutExpired:
+            return -1, "", "timeout (120s)"
+        except Exception as e:
+            return -1, "", str(e)
+
+    # 1) Detectar si hay cambios
+    rc, out, err = run(["git", "status", "--porcelain"])
+    if rc != 0:
+        return False, f"git status falló: {err}"
+    if not out:
+        return True, "Sin cambios en el repo, nada que commitear."
+
+    log_parts.append(f"Cambios detectados:\n```\n{out[:500]}\n```")
+
+    # 2) git add .
+    rc, out, err = run(["git", "add", "."])
+    if rc != 0:
+        return False, f"git add falló: {err}"
+
+    # 3) git commit
+    safe_msg = commit_message.replace("\n", " ")[:200]
+    rc, out, err = run(["git", "commit", "-m", safe_msg])
+    if rc != 0:
+        return False, f"git commit falló: {err[:300]}"
+    log_parts.append(f"✅ Commit creado: `{safe_msg[:80]}`")
+
+    # 4) git push
+    rc, out, err = run(["git", "push"])
+    if rc != 0:
+        log_parts.append(
+            f"⚠️ commit local OK pero push falló: {err[:300]}\n"
+            f"Resolver a mano: `cd {repo_root} && git push`"
+        )
+        return False, "\n".join(log_parts)
+
+    log_parts.append("✅ Push a origin completado.")
+    return True, "\n".join(log_parts)
+
+
+def build_commit_message(tl_planning: str, execution_session_id: str) -> str:
+    """Construye un mensaje de commit conciso a partir del plan del TL."""
+    summary = _extract_plan_objective(tl_planning)
+    short_session = execution_session_id[:8] if execution_session_id else "unknown"
+    return f"feat: sprint aceptado · sesion {short_session} · {summary[:120]}"

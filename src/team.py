@@ -443,6 +443,26 @@ async def _run_analytical_flow(initial_decision: Decision) -> TurnResult:
                             )
                     except Exception:
                         logger.exception("Error escribiendo memoria tras ACEPTADO")
+
+                    # Auto-commit del repo de trading
+                    try:
+                        commit_msg = memory_writer.build_commit_message(
+                            last_planning_reply,
+                            result.execution_session_id,
+                        )
+                        await channel_logger.log(
+                            f"📦 Iniciando auto-commit del repo de trading..."
+                        )
+                        success, log_text = memory_writer.commit_and_push_repo(commit_msg)
+                        icon = "✅" if success else "⚠️"
+                        await channel_logger.log(
+                            f"{icon} Auto-commit:\n{log_text[:1500]}"
+                        )
+                    except Exception:
+                        logger.exception("Error en auto-commit del repo")
+                        await channel_logger.log(
+                            f"🔴 Auto-commit falló con excepción (ver logs del bot)"
+                        )
                     return result
                 else:
                     # Rechazado -> vuelta a PLANNING para iterar
