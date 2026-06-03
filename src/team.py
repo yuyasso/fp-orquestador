@@ -34,6 +34,7 @@ from src.roles import ALL_ROLES, Role
 from src.webhooks import post_as_role
 from src.authorization import request_authorization
 from src import memory_writer
+from src import director
 from src.claude_executor import execute_claude_code, ExecutionResult
 from src import channel_logger, state, memory
 
@@ -266,6 +267,16 @@ async def _run_analytical_flow(initial_decision: Decision) -> TurnResult:
             return result
 
         if action.kind == "request_authorization":
+            # En modo autónomo, AUTHORIZATION se salta: el Director ya autoriza
+            # implícitamente al activar /auto on. Vuelve a botones humanos con /auto off.
+            if state.is_autonomous():
+                await channel_logger.log(
+                    f"🔄 `AUTHORIZATION` → `EXECUTION` · 🤖 auto-autorizado (modo autónomo)"
+                )
+                result.authorization_result = "auto_authorized"
+                apply_transition(state_obj, Phase.EXECUTION)
+                continue
+
             await channel_logger.log(
                 f"🔄 `{state_obj.phase.value}` → solicitando autorización humana"
             )
@@ -463,6 +474,24 @@ async def _run_analytical_flow(initial_decision: Decision) -> TurnResult:
                         await channel_logger.log(
                             f"🔴 Auto-commit falló con excepción (ver logs del bot)"
                         )
+
+                    # Modo autónomo: invocar al Director para decidir siguiente sprint
+                    if state.is_autonomous():
+                        try:
+                            await _invoke_director_and_dispatch(
+                                tl_planning=last_planning_reply,
+                                tl_report=last_tl_report,
+                                po_acceptance=reply,
+                                turn_cost_usd=result.total_cost_usd,
+                            )
+                        except Exception:
+                            logger.exception("Error invocando al Director")
+                            await channel_logger.log(
+                                f"🔴 Director falló con excepción → pausa autónoma"
+                            )
+                            state.disable_autonomous()
+                            await _notify_director_pause("excepción interna del Director")
+
                     return result
                 else:
                     # Rechazado -> vuelta a PLANNING para iterar
@@ -676,6 +705,138 @@ def _summarize_tool_input(name: str, inp: dict) -> str:
     # Genérico
     short = str(inp)[:120]
     return short
+
+
+async def _notify_director_pause(reason: str) -> None:
+    """Publica en #anuncios que el Director ha pausado la cadena autónoma."""
+    if _bot_ref is None:
+        return
+    try:
+        anuncios = _bot_ref.get_channel(settings.discord_anuncios_channel_id)
+        if anuncios is not None:
+            mention = f"<@{settings.discord_my_user_id}>"
+            await anuncios.send(
+                f"⏸️ **Director: pausa autónoma** {mention}\n"
+                f"Motivo: {reason[:500]}\n\n"
+                f"El modo autónomo se ha desactivado. Lanza tu siguiente input cuando quieras "
+                f"o reactívalo con `/auto on`."
+            )
+    except Exception:
+        logger.exception("Error publicando notificación de pausa del Director")
+
+
+async def _notify_director_stop(reason: str) -> None:
+    """Publica en #anuncios que el Director ha detenido el experimento."""
+    if _bot_ref is None:
+        return
+    try:
+        anuncios = _bot_ref.get_channel(settings.discord_anuncios_channel_id)
+        if anuncios is not None:
+            mention = f"<@{settings.discord_my_user_id}>"
+            await anuncios.send(
+                f"🛑 **Director: STOP** {mention}\n"
+                f"Motivo: {reason[:500]}\n\n"
+                f"El modo autónomo se ha desactivado. Decisión humana requerida."
+            )
+    except Exception:
+        logger.exception("Error publicando notificación de stop del Director")
+
+
+async def _invoke_director_and_dispatch(
+    tl_planning: str,
+    tl_report: str,
+    po_acceptance: str,
+    turn_cost_usd: float,
+) -> None:
+    """
+    Invoca al Director tras [ACEPTADO] del PO. Si decide continuar, publica
+    el siguiente mensaje en #lobby como si lo escribiera el humano, lo que
+    desencadena el procesamiento del siguiente turno automáticamente.
+    """
+    # Acumular el coste del turno que acaba de cerrar en la cadena
+    state.add_chain_cost(turn_cost_usd)
+    chain = state.get_chain_status()
+
+    await channel_logger.log(
+        f"🤖 **Director** evaluando... "
+        f"(cadena: {chain['chain_sprints']}/{chain['max_chain_sprints']} sprints, "
+        f"${chain['chain_cost_eur']:.2f}/${chain['max_chain_cost_eur']:.2f})"
+    )
+
+    decision = await director.decide_next_action(
+        tl_planning=tl_planning,
+        tl_report=tl_report,
+        po_acceptance=po_acceptance,
+        sprints_in_autonomous_chain=chain['chain_sprints'],
+        accumulated_cost_eur=chain['chain_cost_eur'],
+        max_chain_sprints=chain['max_chain_sprints'],
+        max_chain_cost_eur=chain['max_chain_cost_eur'],
+    )
+
+    state.add_chain_cost(decision.cost_usd)
+
+    await channel_logger.budget(
+        f"🤖 **Director** (sonnet): ${decision.cost_usd:.4f} · "
+        f"{decision.input_tokens} in / {decision.output_tokens} out"
+    )
+
+    await channel_logger.log(
+        f"🤖 **Director decide:** `{decision.action}` "
+        f"(confianza {decision.confidence}) · {decision.reasoning[:300]}"
+    )
+
+    if decision.action == "stop":
+        state.disable_autonomous()
+        await _notify_director_stop(decision.reasoning)
+        return
+
+    if decision.action == "pause":
+        state.disable_autonomous()
+        await _notify_director_pause(decision.reasoning)
+        return
+
+    # continue: publicar el next_message en #lobby como si lo escribiera el humano
+    if not decision.next_message.strip():
+        state.disable_autonomous()
+        await _notify_director_pause(
+            "Director devolvió continue pero next_message vacío. Pauso por seguridad."
+        )
+        return
+
+    # Bumpeamos el contador ANTES de publicar
+    state.bump_chain_sprint()
+    chain = state.get_chain_status()
+
+    if _bot_ref is None:
+        logger.error("No hay bot_ref para publicar mensaje del Director")
+        state.disable_autonomous()
+        return
+
+    lobby = _bot_ref.get_channel(settings.discord_lobby_channel_id)
+    if lobby is None:
+        logger.error("No se encontró #lobby para publicar mensaje del Director")
+        state.disable_autonomous()
+        return
+
+    # Publicar el mensaje del Director como si fuera del humano (mismo flujo del bot)
+    prefix = (
+        f"🤖 **[Director · sprint {chain['chain_sprints']}/{chain['max_chain_sprints']}]** "
+        f"_(modo autónomo activo, ${chain['chain_cost_eur']:.2f}/${chain['max_chain_cost_eur']:.2f})_\n\n"
+    )
+    full_msg = prefix + decision.next_message
+    # Discord limita a 2000 chars
+    if len(full_msg) > 1990:
+        full_msg = full_msg[:1990]
+
+    try:
+        await lobby.send(full_msg)
+        await channel_logger.log(
+            f"🤖 Director lanzó siguiente sprint en #lobby"
+        )
+    except Exception:
+        logger.exception("Error publicando mensaje del Director en #lobby")
+        state.disable_autonomous()
+        await _notify_director_pause("error publicando next_message en #lobby")
 
 
 async def handle_user_message(

@@ -4,6 +4,7 @@ Comandos del bot.
 - /pausa: detiene el procesamiento de mensajes por el equipo.
 - /resume: reanuda el procesamiento.
 - /estado: muestra el estado actual del orquestador.
+- /auto on|off|status: gestiona el modo autónomo (Director decide próximo sprint).
 Permisos: solo el usuario configurado en DISCORD_MY_USER_ID puede ejecutarlos.
 """
 import logging
@@ -172,9 +173,78 @@ def register_commands(bot: commands.Bot) -> None:
             return
         paused = state.is_paused()
         n_msgs = count_messages()
+        chain = state.get_chain_status()
         status = "⏸️ PAUSADO" if paused else "▶️ ACTIVO"
+        auto = "🤖 ON" if chain["autonomous_mode"] else "👤 OFF"
         await interaction.response.send_message(
             f"**Estado:** {status}\n"
+            f"**Modo autónomo:** {auto}\n"
+            f"**Cadena autónoma:** {chain['chain_sprints']}/{chain['max_chain_sprints']} sprints · "
+            f"${chain['chain_cost_eur']:.2f}/${chain['max_chain_cost_eur']:.2f}\n"
             f"**Mensajes en historial:** {n_msgs}",
             ephemeral=True,
         )
+
+    # /auto: gestión del modo autónomo
+    auto_group = discord.app_commands.Group(
+        name="auto",
+        description="Gestiona el modo autónomo del orquestador.",
+        guild_ids=[settings.discord_guild_id],
+    )
+
+    @auto_group.command(name="on", description="Activa el modo autónomo (Director decide próximo sprint).")
+    async def auto_on(interaction: discord.Interaction):
+        if not _is_owner(interaction):
+            await interaction.response.send_message("No tienes permiso.", ephemeral=True)
+            return
+        if state.is_autonomous():
+            chain = state.get_chain_status()
+            await interaction.response.send_message(
+                f"🤖 Ya estaba ON. Cadena actual: {chain['chain_sprints']}/{chain['max_chain_sprints']} sprints, "
+                f"${chain['chain_cost_eur']:.2f} acumulados.",
+                ephemeral=True,
+            )
+            return
+        state.enable_autonomous()
+        chain = state.get_chain_status()
+        await interaction.response.send_message(
+            f"🤖 **Modo autónomo ACTIVADO.**\n"
+            f"El Director decidirá automáticamente el siguiente sprint tras cada `[ACEPTADO]`.\n"
+            f"Límites de seguridad: máx {chain['max_chain_sprints']} sprints consecutivos y "
+            f"${chain['max_chain_cost_eur']:.2f} de coste acumulado antes de pausa forzosa."
+        )
+        await channel_logger.log(
+            f"🤖 **Modo autónomo ACTIVADO** por <@{interaction.user.id}>"
+        )
+
+    @auto_group.command(name="off", description="Desactiva el modo autónomo. El sistema vuelve a esperar input humano.")
+    async def auto_off(interaction: discord.Interaction):
+        if not _is_owner(interaction):
+            await interaction.response.send_message("No tienes permiso.", ephemeral=True)
+            return
+        if not state.is_autonomous():
+            await interaction.response.send_message("👤 Ya estaba OFF.", ephemeral=True)
+            return
+        state.disable_autonomous()
+        await interaction.response.send_message(
+            "👤 **Modo autónomo DESACTIVADO.** El sistema vuelve a esperar tu input tras cada sprint."
+        )
+        await channel_logger.log(
+            f"👤 **Modo autónomo DESACTIVADO** por <@{interaction.user.id}>"
+        )
+
+    @auto_group.command(name="status", description="Muestra el estado de la cadena autónoma.")
+    async def auto_status(interaction: discord.Interaction):
+        if not _is_owner(interaction):
+            await interaction.response.send_message("No tienes permiso.", ephemeral=True)
+            return
+        chain = state.get_chain_status()
+        icon = "🤖 ON" if chain["autonomous_mode"] else "👤 OFF"
+        await interaction.response.send_message(
+            f"**Modo autónomo:** {icon}\n"
+            f"**Sprints en cadena:** {chain['chain_sprints']}/{chain['max_chain_sprints']}\n"
+            f"**Coste acumulado:** ${chain['chain_cost_eur']:.2f}/${chain['max_chain_cost_eur']:.2f}",
+            ephemeral=True,
+        )
+
+    bot.tree.add_command(auto_group, guild=guild_obj)
