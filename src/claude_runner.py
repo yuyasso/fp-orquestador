@@ -28,26 +28,49 @@ async def run_claude(
     """
     Invoca claude-code en modo headless y devuelve la respuesta parseada.
 
+    Pasa el prompt y el system_prompt por stdin para evitar el limite ARG_MAX
+    del SO (~128 KB) que rompia con historial grande + memoria + system prompt
+    como argumentos.
+
     model: 'haiku', 'sonnet' o 'opus' (alias que Claude Code resuelve).
     """
-    cmd = ["claude", "-p", prompt, "--model", model, "--output-format", "json"]
-
+    # -p sin argumento posicional -> lee prompt de stdin con --input-format text.
+    cmd = [
+        "claude",
+        "-p",
+        "--model", model,
+        "--output-format", "json",
+        "--input-format", "text",
+    ]
     if system_prompt:
-        cmd.extend(["--system-prompt", system_prompt])
+        cmd.extend(["--append-system-prompt", system_prompt])
     if session_id:
         cmd.extend(["--resume", session_id])
 
-    logger.info(f"Ejecutando Claude Code (modelo={model}, prompt={prompt[:60]}...)")
+    logger.info(
+        f"Ejecutando Claude Code (modelo={model}, "
+        f"prompt={prompt[:60]}... [{len(prompt)} chars])"
+    )
+
+    # NOTA: system_prompt aun va como argumento (no hay flag stdin para el).
+    # Si crece demasiado tambien rompera ARG_MAX; vigilar.
+    sp_len = len(system_prompt) if system_prompt else 0
+    if sp_len > 60_000:
+        logger.warning(
+            f"system_prompt grande ({sp_len} chars). Cercano a limite ARG_MAX."
+        )
 
     proc = await asyncio.create_subprocess_exec(
         *cmd,
+        stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
 
     try:
         stdout, stderr = await asyncio.wait_for(
-            proc.communicate(), timeout=timeout_seconds
+            proc.communicate(input=prompt.encode("utf-8")),
+            timeout=timeout_seconds,
         )
     except asyncio.TimeoutError:
         proc.kill()
@@ -56,7 +79,7 @@ async def run_claude(
 
     if proc.returncode != 0:
         raise RuntimeError(
-            f"Claude Code salió con código {proc.returncode}. "
+            f"Claude Code salio con codigo {proc.returncode}. "
             f"stderr: {stderr.decode('utf-8', errors='replace')[:500]}"
         )
 

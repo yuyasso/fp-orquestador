@@ -59,11 +59,14 @@ async def execute_claude_code(
     if not cwd.exists():
         return ExecutionResult(success=False, error=f"cwd no existe: {cwd}")
 
+    # Pasamos el prompt por stdin para evitar el limite ARG_MAX del SO (~128 KB).
+    # -p sin argumento posicional lee de stdin.
     cmd = [
         "claude",
-        "-p", prompt,
+        "-p",
         "--model", model,
         "--output-format", "stream-json",
+        "--input-format", "text",
         "--verbose",
     ]
 
@@ -84,6 +87,7 @@ async def execute_claude_code(
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(cwd),
@@ -125,6 +129,18 @@ async def execute_claude_code(
         nonlocal stderr_bytes
         assert proc.stderr is not None
         stderr_bytes = await proc.stderr.read()
+
+    # Enviar el prompt por stdin y cerrar para que claude empiece a procesar
+    try:
+        assert proc.stdin is not None
+        proc.stdin.write(prompt.encode("utf-8"))
+        await proc.stdin.drain()
+        proc.stdin.close()
+    except Exception:
+        logger.exception("Error escribiendo prompt a stdin de claude")
+        proc.kill()
+        await proc.wait()
+        return ExecutionResult(success=False, error="No se pudo enviar prompt a stdin")
 
     try:
         await asyncio.wait_for(
